@@ -1,0 +1,39 @@
+name: Render Video Bake
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_id:
+        description: 'Room ID to render'
+        required: true
+        type: string
+      resolution:
+        description: 'Resolution (480, 720, 1080)'
+        required: true
+        type: string
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Render Script
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+        run: python render.py --room_id "${{ inputs.room_id }}" --resolution "${{ inputs.resolution }}"
