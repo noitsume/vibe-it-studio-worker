@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "contentHash": "local-sample",
+  "slides": [
+    {
+      "id": 1000,
+      "name": "Pembuka",
+      "duration": 1.2,
+      "musicVolume": 100,
+      "isTransition": false,
+      "transition": {"type": "fade", "duration": 0.5},
+      "elements": [
+        {
+          "id": "text-1",
+          "type": "text",
+          "content": "VibeItStudio",
+          "x": 18,
+          "y": 40,
+          "w": 64,
+          "h": 16,
+          "rotation": 0,
+          "opacity": 1,
+          "zIndex": 1,
+          "fontSize": 64,
+          "fontFamily": "DejaVu Sans",
+          "bold": true,
+          "italic": false,
+          "color": "#ff6161"
+        }
+      ]
+    },
+    {
+      "id": 1001,
+      "name": "Penutup",
+      "duration": 1.2,
+      "musicVolume": 100,
+      "isTransition": false,
+      "transition": {"type": "none", "duration": 0},
+      "elements": [
+        {
+          "id": "text-2",
+          "type": "text",
+          "content": "Render worker siap",
+          "x": 20,
+          "y": 42,
+          "w": 60,
+          "h": 16,
+          "rotation": 0,
+          "opacity": 1,
+          "zIndex": 1,
+          "fontSize": 52,
+          "fontFamily": "DejaVu Sans",
+          "bold": false,
+          "italic": false,
+          "color": "#ffffff"
+        }
+      ]
+    }
+  ],
+  "music": {"mediaId": null, "name": null, "duration": 0, "loopStart": 0},
+  "mediaLibrary": []
+}

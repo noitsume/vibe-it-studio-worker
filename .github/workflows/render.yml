@@ -4,36 +4,87 @@ on:
   workflow_dispatch:
     inputs:
       room_id:
-        description: 'Room ID to render'
+        description: Room ID yang akan di-Bake
         required: true
+        type: string
+      job_id:
+        description: Render job ID dari Firestore (disarankan)
+        required: false
         type: string
       resolution:
-        description: 'Resolution (480, 720, 1080)'
+        description: Resolusi output
         required: true
-        type: string
+        default: "720"
+        type: choice
+        options:
+          - "480"
+          - "720"
+          - "1080"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibeit-render-${{ inputs.room_id }}
+  cancel-in-progress: false
 
 jobs:
   bake:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+      WORKER_FFMPEG_PRESET: ${{ vars.WORKER_FFMPEG_PRESET || 'medium' }}
+      WORKER_MAX_MEDIA_BYTES: ${{ vars.WORKER_MAX_MEDIA_BYTES || '2147483648' }}
+      WORKER_MAX_TIMELINE_BYTES: ${{ vars.WORKER_MAX_TIMELINE_BYTES || '921600' }}
+
     steps:
-      - name: Checkout Code
+      - name: Checkout worker
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg and system fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg fontconfig fonts-dejavu-core fonts-liberation
 
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: python -m pip install --requirement requirements.txt
 
-      - name: Run Render Script
-        env:
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
-        run: python render.py --room_id "${{ inputs.room_id }}" --resolution "${{ inputs.resolution }}"
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in FIREBASE_SERVICE_ACCOUNT B2_KEY_ID B2_APPLICATION_KEY B2_BUCKET_NAME; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Repository secret $name belum tersedia"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Run worker tests
+        run: python -m pytest -q
+
+      - name: Render and upload final video
+        shell: bash
+        run: |
+          args=(
+            --room_id "${{ inputs.room_id }}"
+            --resolution "${{ inputs.resolution }}"
+          )
+          if [ -n "${{ inputs.job_id }}" ]; then
+            args+=(--job_id "${{ inputs.job_id }}")
+          fi
+          python render.py "${args[@]}"

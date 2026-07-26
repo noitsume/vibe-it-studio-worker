@@ -1,29 +1,53 @@
-name: Custom Lifecycle Sweeper
+name: Expired Room Sweeper
 
 on:
   schedule:
-    - cron: '0 17 * * *' # 17:00 UTC = 00:00 WIB (UTC+7)
-  workflow_dispatch: # Bisa juga dijalankan manual buat tes
+    - cron: "0 17 * * *" # 00:00 WIB
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Hapus file sungguhan (false = dry-run)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibeit-sweeper
+  cancel-in-progress: false
 
 jobs:
   sweep:
+    if: github.event_name == 'workflow_dispatch' || vars.SWEEPER_ENABLED == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+      SWEEPER_APPLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.apply) || vars.SWEEPER_APPLY == 'true' }}
+      SWEEPER_MAX_ROOMS: ${{ vars.SWEEPER_MAX_ROOMS || '20' }}
+      SWEEPER_DELETE_FINAL: ${{ vars.SWEEPER_DELETE_FINAL || 'false' }}
+      SWEEPER_FINAL_RETENTION_DAYS: ${{ vars.SWEEPER_FINAL_RETENTION_DAYS || '30' }}
+      SWEEPER_PRUNE_FIRESTORE_METADATA: ${{ vars.SWEEPER_PRUNE_FIRESTORE_METADATA || 'false' }}
+
     steps:
-      - name: Checkout Code
+      - name: Checkout worker
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: python -m pip install --requirement requirements.txt
 
-      - name: Run Sweeper Script
-        env:
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+      - name: Sweep expired room files
         run: python sweeper.py

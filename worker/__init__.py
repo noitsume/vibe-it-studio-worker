@@ -1,0 +1,1 @@
+"""VibeItStudio render worker package."""
