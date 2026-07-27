@@ -296,7 +296,9 @@ class FFmpegRenderer:
     ) -> None:
         duration = max(0.1, duration)
         width, height = self.profile.width, self.profile.height
-        background = _escape_color(slide.get("backgroundColor"), "#111318")
+        # Editor canvas memakai putih sebagai latar default; jangan jatuhkan
+        # hasil Bake ke hitam ketika field warna belum ada pada timeline lama.
+        background = _escape_color(slide.get("backgroundColor"), "#ffffff")
         command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
         command.extend([
             "-f",
