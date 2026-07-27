@@ -88,3 +88,15 @@ jobs:
             args+=(--job_id "${{ inputs.job_id }}")
           fi
           python render.py "${args[@]}"
+
+      - name: Mark failed Bake job
+        if: ${{ failure() && inputs.job_id != '' }}
+        shell: bash
+        env:
+          BAKE_FAILURE_MESSAGE: >-
+            Pipeline GitHub Actions gagal sebelum Bake selesai.
+            Periksa run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}.
+        run: >-
+          python mark_failed.py
+          --job_id "${{ inputs.job_id }}"
+          --message "$BAKE_FAILURE_MESSAGE"

@@ -129,6 +129,7 @@ def _render_remote(args: argparse.Namespace) -> int:
     try:
         job_snapshot = store.db.collection("render_jobs").document(job_id).get()
         job_preview = job_snapshot.to_dict() if job_snapshot.exists else {}
+        job_record_ready = job_snapshot.exists
         snapshot_payload = None
         snapshot_path = (job_preview or {}).get("snapshotPath")
         if snapshot_path:

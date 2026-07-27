@@ -590,8 +590,12 @@ class FFmpegRenderer:
             ordered_segments.append(transition_path)
 
         concat_file = self.work_dir / "concat.txt"
+        escaped_segments = [
+            str(path.resolve()).replace("'", "'\\''")
+            for path in ordered_segments
+        ]
         concat_file.write_text(
-            "\n".join(f"file '{str(path.resolve()).replace(chr(39), chr(39) + '\\\\' + chr(39) + chr(39))}'" for path in ordered_segments),
+            "\n".join(f"file '{path}'" for path in escaped_segments),
             encoding="utf-8",
         )
         stitched = self.work_dir / "stitched.mp4"
