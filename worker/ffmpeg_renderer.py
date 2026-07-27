@@ -190,6 +190,7 @@ class FFmpegRenderer:
         }
         self.media_paths = media_paths
         self.music = music or {}
+        self.music_bed_path: Path | None = None
         self.fonts = FontResolver(project_root)
         self.probe_cache: dict[Path, dict[str, Any]] = {}
         self.text_counter = 0
@@ -255,31 +256,116 @@ class FFmpegRenderer:
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
 
+    def _prepare_music_bed(self, total_duration: float) -> None:
+        self.music_bed_path = None
+        media_id = self.music.get("mediaId")
+        if not media_id:
+            return
+
+        path = self.media_paths.get(str(media_id))
+        metadata = self.media_by_id.get(str(media_id))
+        if not path or not path.exists():
+            logging.warning("Music mediaId %s tidak tersedia; render dilanjutkan tanpa musik.", media_id)
+            return
+
+        probe = self._probe(path)
+        if not probe.get("hasAudio"):
+            logging.warning("File musik tidak memiliki audio stream: %s", path)
+            return
+
+        source_duration = _num(
+            metadata.get("duration") if metadata else probe.get("duration"),
+            _num(probe.get("duration"), 0),
+        )
+        if source_duration <= 0:
+            logging.warning("Durasi musik tidak valid; render dilanjutkan tanpa musik: %s", path)
+            return
+
+        # Selama video belum melewati akhir lagu, setiap segmen cukup mengambil
+        # posisi timeline yang sama dari file asli. loopStart tidak boleh
+        # memengaruhi intro.
+        if total_duration <= source_duration + 0.001:
+            self.music_bed_path = path
+            return
+
+        loop_start = _clamp(
+            _num(self.music.get("loopStart"), 0.0),
+            0.0,
+            source_duration,
+        )
+        loop_duration = source_duration - loop_start
+        if loop_duration <= 0.05:
+            logging.warning(
+                "loopStart musik terlalu dekat dengan akhir; seluruh lagu dipakai sebagai area loop."
+            )
+            loop_start = 0.0
+            loop_duration = source_duration
+
+        loop_samples = max(1, round(loop_duration * 48_000))
+        music_bed = self.work_dir / "music-bed.flac"
+        filters = [
+            "[0:a]aresample=48000,asplit=2[intro_source][loop_source]",
+            (
+                f"[intro_source]atrim=start=0:end={source_duration:.6f},"
+                "asetpts=PTS-STARTPTS[intro]"
+            ),
+            (
+                f"[loop_source]atrim=start={loop_start:.6f}:end={source_duration:.6f},"
+                f"asetpts=PTS-STARTPTS,aloop=loop=-1:size={loop_samples}[loop]"
+            ),
+            (
+                f"[intro][loop]concat=n=2:v=0:a=1,atrim=duration={total_duration:.6f},"
+                "asetpts=PTS-STARTPTS[aout]"
+            ),
+        ]
+        run_command([
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[aout]",
+            "-vn",
+            "-c:a",
+            "flac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(music_bed),
+        ])
+        self.music_bed_path = music_bed
+        logging.info(
+            "Music bed disiapkan: intro=0-%.3fs loop=%.3f-%.3fs total=%.3fs",
+            source_duration,
+            loop_start,
+            source_duration,
+            total_duration,
+        )
+
     def _append_music_input(
         self,
         command: list[str],
         *,
         entry_start: float,
     ) -> tuple[int | None, dict[str, Any] | None]:
-        media_id = self.music.get("mediaId")
-        if not media_id:
+        path = self.music_bed_path
+        if not path:
             return None, None
-        path = self.media_paths.get(str(media_id))
-        metadata = self.media_by_id.get(str(media_id))
-        if not path or not path.exists():
-            logging.warning("Music mediaId %s tidak tersedia; render dilanjutkan tanpa musik.", media_id)
+        if not path.exists():
+            logging.warning("Music bed tidak tersedia; render dilanjutkan tanpa musik: %s", path)
             return None, None
         probe = self._probe(path)
         if not probe.get("hasAudio"):
             logging.warning("File musik tidak memiliki audio stream: %s", path)
             return None, None
-        duration = _num(metadata.get("duration") if metadata else probe.get("duration"), 0)
-        loop_start = max(0.0, _num(self.music.get("loopStart"), 0.0))
-        offset = loop_start + max(0.0, entry_start)
-        if duration > 0:
-            offset %= duration
         index = self._input_count(command)
-        command.extend(["-stream_loop", "-1", "-ss", f"{offset:.6f}", "-i", str(path)])
+        command.extend(["-ss", f"{max(0.0, entry_start):.6f}", "-i", str(path)])
         return index, probe
 
     @staticmethod
@@ -546,6 +632,7 @@ class FFmpegRenderer:
         sequence = build_playback_sequence(slides)
         if not sequence:
             raise RuntimeError("Timeline tidak memiliki slide biasa yang dapat di-Bake.")
+        self._prepare_music_bed(max(entry.end for entry in sequence))
 
         normal_entries = [entry for entry in sequence if entry.kind == "slide"]
         normal_segments: dict[int, Path] = {}
