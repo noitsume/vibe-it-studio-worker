@@ -191,7 +191,6 @@ class FirestoreStore:
         batch.set(
             room_ref,
             {
-                "status": "Baked",
                 "updatedAt": self.server_timestamp,
                 "lastBakedAt": self.server_timestamp,
                 "lastBakedContentHash": source_hash,
