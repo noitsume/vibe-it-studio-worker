@@ -165,7 +165,7 @@ def _render_remote(args: argparse.Namespace) -> int:
             music=timeline.get("music") or {},
         )
         duration = renderer.render(list(timeline.get("slides") or []), final_local)
-        final_remote = f"rooms/{room_id}/final/{job_id}.mp4"
+        final_remote = f"rooms/{room_id}/final/current.mp4"
         digest = sha256_file(final_local)
         uploaded_version = storage.upload(
             final_local,
@@ -189,6 +189,18 @@ def _render_remote(args: argparse.Namespace) -> int:
             sha256=digest,
             receiver_token_hash=source.room.get("receiverTokenHash"),
         )
+        try:
+            removed = storage.delete_prefix_except(
+                f"rooms/{room_id}/final/",
+                keep_file_name=final_remote,
+                keep_version_id=uploaded_version.id_,
+            )
+            if removed:
+                logging.info("Final B2 lama dibersihkan: %s object version(s).", removed)
+        except Exception:
+            # Final Firestore sudah menunjuk object baru; kegagalan housekeeping
+            # tidak boleh membuat Bake sukses terlihat gagal.
+            logging.exception("Gagal membersihkan final B2 lama.")
         logging.info(
             "Bake selesai: room=%s job=%s duration=%.3fs path=%s",
             room_id,

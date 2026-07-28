@@ -58,3 +58,25 @@ class B2Storage:
             if apply:
                 self.api.delete_file_version(version.id_, version.file_name)
         return len(versions)
+
+    def delete_prefix_except(
+        self,
+        prefix: str,
+        *,
+        keep_file_name: str,
+        keep_version_id: str,
+    ) -> int:
+        safe_prefix = ensure_relative_b2_path(prefix)
+        deleted = 0
+        for version, _folder in self.bucket.ls(
+            folder_to_list=safe_prefix,
+            latest_only=False,
+            recursive=True,
+        ):
+            if not version.file_name.startswith(safe_prefix):
+                continue
+            if version.file_name == keep_file_name and version.id_ == keep_version_id:
+                continue
+            self.api.delete_file_version(version.id_, version.file_name)
+            deleted += 1
+        return deleted
