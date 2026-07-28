@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -70,8 +71,14 @@ def _load_local_payload(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]
     return timeline, media_library, media_paths
 
 
-def _download_media(storage: Any, media_library: list[dict[str, Any]], media_dir: Path) -> dict[str, Path]:
-    paths: dict[str, Path] = {}
+def _download_media(
+    storage: Any,
+    media_library: list[dict[str, Any]],
+    media_dir: Path,
+    *,
+    workers: int = 4,
+) -> dict[str, Path]:
+    downloads: list[tuple[str, str, Path]] = []
     for media in media_library:
         media_id = str(media.get("id") or media.get("mediaId") or "")
         remote_path = media.get("filePath")
@@ -81,8 +88,30 @@ def _download_media(storage: Any, media_library: list[dict[str, Any]], media_dir
         remote = ensure_relative_b2_path(str(remote_path), f"media {media_id}.filePath")
         suffix = Path(remote).suffix[:16] or ".bin"
         local = media_dir / f"{media_id}{suffix}"
-        storage.download(remote, local)
-        paths[media_id] = local
+        downloads.append((media_id, remote, local))
+
+    if not downloads:
+        return {}
+
+    worker_count = max(1, min(workers, len(downloads)))
+    logging.info(
+        "Mengunduh %s media B2 dengan %s koneksi paralel.",
+        len(downloads),
+        worker_count,
+    )
+    paths: dict[str, Path] = {}
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="vibe-download",
+    ) as executor:
+        futures = {
+            executor.submit(storage.download, remote, local): (media_id, local)
+            for media_id, remote, local in downloads
+        }
+        for future in as_completed(futures):
+            media_id, local = futures[future]
+            future.result()
+            paths[media_id] = local
     return paths
 
 
@@ -153,7 +182,12 @@ def _render_remote(args: argparse.Namespace) -> int:
         store.mark_started(job_id, resolution=args.resolution, source_hash=source_hash)
 
         media_dir = temporary_root / "media"
-        media_paths = _download_media(storage, media_library, media_dir)
+        media_paths = _download_media(
+            storage,
+            media_library,
+            media_dir,
+            workers=config.download_workers,
+        )
         final_local = args.output.resolve() if args.output else temporary_root / "final.mp4"
         renderer = FFmpegRenderer(
             project_root=args.project_root.resolve(),
@@ -163,6 +197,7 @@ def _render_remote(args: argparse.Namespace) -> int:
             media_library=media_library,
             media_paths=media_paths,
             music=timeline.get("music") or {},
+            proxy_workers=config.proxy_workers,
         )
         duration = renderer.render(list(timeline.get("slides") or []), final_local)
         final_remote = f"rooms/{room_id}/final/current.mp4"

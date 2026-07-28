@@ -17,6 +17,8 @@ class WorkerConfig:
     max_media_bytes: int
     max_timeline_bytes: int
     ffmpeg_preset: str
+    download_workers: int
+    proxy_workers: int
     keep_temp: bool
 
 
@@ -79,5 +81,17 @@ def load_worker_config() -> WorkerConfig:
             950 * 1024,
         ),
         ffmpeg_preset=preset,
+        download_workers=bounded_int(
+            os.getenv("WORKER_DOWNLOAD_WORKERS"),
+            4,
+            1,
+            8,
+        ),
+        proxy_workers=bounded_int(
+            os.getenv("WORKER_PROXY_WORKERS"),
+            2,
+            1,
+            4,
+        ),
         keep_temp=parse_bool(os.getenv("WORKER_KEEP_TEMP"), False),
     )

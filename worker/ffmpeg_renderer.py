@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import subprocess
 import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .playback import PlaybackEntry, build_playback_sequence
+from .render_planner import MediaOptimization, RenderPlan, build_render_plan
 from .utils import require_executable, run_command
 
 FPS = 30
@@ -24,9 +27,9 @@ class ResolutionProfile:
 
 
 RESOLUTIONS: dict[str, ResolutionProfile] = {
-    "480": ResolutionProfile(854, 480, 25),
-    "720": ResolutionProfile(1280, 720, 23),
-    "1080": ResolutionProfile(1920, 1080, 21),
+    "480": ResolutionProfile(854, 480, 23),
+    "720": ResolutionProfile(1280, 720, 20),
+    "1080": ResolutionProfile(1920, 1080, 18),
 }
 
 def _transition_blend_expression(transition_type: str, duration: float) -> str:
@@ -85,6 +88,17 @@ def _atempo_chain(speed: float) -> str:
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
 
+def _frame_rate(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text or text in {"0/0", "N/A"}:
+        return 0.0
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        divisor = _num(denominator, 0.0)
+        return _num(numerator, 0.0) / divisor if divisor else 0.0
+    return _num(text, 0.0)
+
+
 def probe_media(path: Path) -> dict[str, Any]:
     ffprobe = require_executable("ffprobe")
     result = run_command(
@@ -93,7 +107,7 @@ def probe_media(path: Path) -> dict[str, Any]:
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,width,height",
+            "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate",
             "-of",
             "json",
             str(path),
@@ -103,10 +117,22 @@ def probe_media(path: Path) -> dict[str, Any]:
     payload = json.loads(result.stdout or "{}")
     streams = payload.get("streams") or []
     duration = _num((payload.get("format") or {}).get("duration"), 0.0)
+    video_stream = next(
+        (stream for stream in streams if stream.get("codec_type") == "video"),
+        {},
+    )
     return {
         "duration": duration,
         "hasVideo": any(stream.get("codec_type") == "video" for stream in streams),
         "hasAudio": any(stream.get("codec_type") == "audio" for stream in streams),
+        "codecName": str(video_stream.get("codec_name") or ""),
+        "width": max(0, int(_num(video_stream.get("width"), 0))),
+        "height": max(0, int(_num(video_stream.get("height"), 0))),
+        "fps": max(
+            0.0,
+            _frame_rate(video_stream.get("avg_frame_rate")),
+            _frame_rate(video_stream.get("r_frame_rate")),
+        ),
     }
 
 
@@ -175,6 +201,7 @@ class FFmpegRenderer:
         media_library: list[dict[str, Any]],
         media_paths: dict[str, Path],
         music: dict[str, Any],
+        proxy_workers: int | None = None,
     ) -> None:
         require_executable("ffmpeg")
         require_executable("ffprobe")
@@ -189,8 +216,19 @@ class FFmpegRenderer:
             str(item.get("id") or item.get("mediaId")): item for item in media_library
         }
         self.media_paths = media_paths
+        self.original_media_paths = dict(media_paths)
         self.music = music or {}
         self.music_bed_path: Path | None = None
+        self.render_plan: RenderPlan | None = None
+        self.proxy_workers = max(
+            1,
+            min(
+                4,
+                proxy_workers
+                if proxy_workers is not None
+                else max(1, (os.cpu_count() or 2) // 2),
+            ),
+        )
         self.fonts = FontResolver(project_root)
         self.probe_cache: dict[Path, dict[str, Any]] = {}
         self.text_counter = 0
@@ -201,24 +239,67 @@ class FFmpegRenderer:
             self.probe_cache[path] = probe_media(path)
         return self.probe_cache[path]
 
-    def _encoding_args(self) -> list[str]:
+    @staticmethod
+    def _cpu_count() -> int:
+        return max(1, os.cpu_count() or 2)
+
+    def _decoder_threads(self, video_inputs: int) -> int:
+        return max(1, min(4, self._cpu_count() // max(2, video_inputs + 1)))
+
+    def _filter_threads(self, video_inputs: int) -> int:
+        return max(1, min(self._cpu_count(), max(1, video_inputs)))
+
+    def _effective_preset(self, video_inputs: int) -> str:
+        presets = [
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+        ]
+        configured_index = presets.index(self.preset)
+        if video_inputs >= 4:
+            return presets[min(configured_index, presets.index("faster"))]
+        if video_inputs >= 2:
+            return presets[min(configured_index, presets.index("fast"))]
+        return self.preset
+
+    def _encoding_args(self, *, video_inputs: int = 0) -> list[str]:
+        encoder_threads = max(
+            1,
+            self._cpu_count() - min(max(0, video_inputs), max(1, self._cpu_count() // 2)),
+        )
         return [
             "-r",
             str(FPS),
             "-c:v",
             "libx264",
             "-preset",
-            self.preset,
+            self._effective_preset(video_inputs),
             "-crf",
             str(self.profile.crf),
+            "-profile:v",
+            "high",
+            "-x264-params",
+            "aq-mode=3:aq-strength=0.85:deblock=-1,-1",
             "-pix_fmt",
             "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-g",
             str(FPS * 2),
             "-keyint_min",
             str(FPS * 2),
             "-sc_threshold",
             "0",
+            "-threads",
+            str(encoder_threads),
             "-c:a",
             "aac",
             "-b:a",
@@ -227,6 +308,10 @@ class FFmpegRenderer:
             "48000",
             "-ac",
             "2",
+            "-max_muxing_queue_size",
+            "4096",
+            "-metadata",
+            "comment=VibeItStudio Vibe Render Engine",
             "-movflags",
             "+faststart",
         ]
@@ -255,6 +340,161 @@ class FFmpegRenderer:
         path = self.work_dir / f"text-{self.text_counter:04d}.txt"
         path.write_text("\n".join(lines), encoding="utf-8")
         return path
+
+    def _render_proxy(self, optimization: MediaOptimization, destination: Path) -> Path:
+        source = self.original_media_paths.get(optimization.media_id)
+        if not source or not source.exists():
+            raise RuntimeError(
+                f"Source proxy tidak tersedia: {optimization.media_id}"
+            )
+        probe = self._probe(source)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            str(max(1, min(2, self._cpu_count() // self.proxy_workers))),
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-vf",
+            (
+                f"scale={optimization.target_width}:{optimization.target_height}:"
+                f"flags=bicubic,fps={optimization.target_fps:.6f},format=yuv420p"
+            ),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "14",
+            "-tune",
+            "fastdecode",
+            "-profile:v",
+            "high",
+            "-g",
+            str(FPS * 2),
+            "-keyint_min",
+            str(FPS * 2),
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-refs",
+            "1",
+        ]
+        if probe.get("hasAudio"):
+            command.extend([
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+            ])
+        command.extend([
+            "-max_muxing_queue_size",
+            "4096",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ])
+        run_command(command)
+        return destination
+
+    def _prepare_render_plan(self, slides: list[dict[str, Any]]) -> None:
+        probes: dict[str, dict[str, Any]] = {}
+        for media_id, metadata in self.media_by_id.items():
+            path = self.original_media_paths.get(media_id)
+            if not path or not path.exists():
+                continue
+            if str(metadata.get("type") or "") != "video":
+                continue
+            probes[media_id] = self._probe(path)
+
+        self.render_plan = build_render_plan(
+            slides=slides,
+            output_width=self.profile.width,
+            output_height=self.profile.height,
+            media_by_id=self.media_by_id,
+            media_paths=self.original_media_paths,
+            probes=probes,
+            output_fps=FPS,
+        )
+        plan = self.render_plan
+        logging.info(
+            "Vibe Render Plan: peak_video=%s occurrences=%s proxy=%s direct=%s",
+            plan.peak_video_inputs,
+            plan.total_video_occurrences,
+            plan.proxy_count,
+            len(plan.optimizations) - plan.proxy_count,
+        )
+        for optimization in plan.optimizations:
+            logging.info(
+                "Media plan %s: %s %sx%s@%.2f -> %sx%s@%.2f (%s)",
+                optimization.media_id,
+                optimization.action,
+                optimization.source_width,
+                optimization.source_height,
+                optimization.source_fps,
+                optimization.target_width,
+                optimization.target_height,
+                optimization.target_fps,
+                ",".join(optimization.reasons),
+            )
+
+        proxy_items = [
+            item for item in plan.optimizations if item.uses_proxy
+        ]
+        if not proxy_items:
+            return
+
+        proxy_dir = self.work_dir / "proxies"
+        proxy_dir.mkdir(parents=True, exist_ok=True)
+        worker_count = min(self.proxy_workers, len(proxy_items))
+        logging.info(
+            "Menyiapkan %s adaptive proxy dengan %s worker.",
+            len(proxy_items),
+            worker_count,
+        )
+        prepared: dict[str, Path] = {}
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="vibe-proxy",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._render_proxy,
+                    item,
+                    proxy_dir / f"{item.media_id}.mp4",
+                ): item
+                for item in proxy_items
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                proxy_path = future.result()
+                prepared[item.media_id] = proxy_path
+                logging.info(
+                    "Adaptive proxy siap: %s (%s byte).",
+                    item.media_id,
+                    proxy_path.stat().st_size,
+                )
+
+        self.media_paths = {
+            media_id: prepared.get(media_id, path)
+            for media_id, path in self.original_media_paths.items()
+        }
+        for media_id, proxy_path in prepared.items():
+            self.probe_cache[proxy_path] = probe_media(proxy_path)
 
     def _prepare_music_bed(self, total_duration: float) -> None:
         self.music_bed_path = None
@@ -365,7 +605,14 @@ class FFmpegRenderer:
             logging.warning("File musik tidak memiliki audio stream: %s", path)
             return None, None
         index = self._input_count(command)
-        command.extend(["-ss", f"{max(0.0, entry_start):.6f}", "-i", str(path)])
+        command.extend([
+            "-thread_queue_size",
+            "128",
+            "-ss",
+            f"{max(0.0, entry_start):.6f}",
+            "-i",
+            str(path),
+        ])
         return index, probe
 
     @staticmethod
@@ -385,7 +632,30 @@ class FFmpegRenderer:
         # Editor canvas memakai putih sebagai latar default; jangan jatuhkan
         # hasil Bake ke hitam ketika field warna belum ada pada timeline lama.
         background = _escape_color(slide.get("backgroundColor"), "#ffffff")
-        command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        elements = sorted(
+            list(slide.get("elements") or []),
+            key=lambda item: _num(item.get("zIndex"), 0),
+        )
+        video_input_count = sum(
+            1
+            for element in elements
+            if element.get("type") == "media"
+            and str(
+                element.get("mediaType")
+                or (self.media_by_id.get(str(element.get("mediaId") or "")) or {}).get("type")
+                or ""
+            ) == "video"
+            and bool(self.media_paths.get(str(element.get("mediaId") or "")))
+        )
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-filter_complex_threads",
+            str(self._filter_threads(video_input_count)),
+        ]
         command.extend([
             "-f",
             "lavfi",
@@ -407,11 +677,6 @@ class FFmpegRenderer:
         audio_labels = ["silence"]
         media_input_data: list[tuple[dict[str, Any], int, Path, dict[str, Any]]] = []
 
-        elements = sorted(
-            list(slide.get("elements") or []),
-            key=lambda item: _num(item.get("zIndex"), 0),
-        )
-
         for element in elements:
             if element.get("type") != "media":
                 continue
@@ -428,7 +693,18 @@ class FFmpegRenderer:
             if media_type == "image":
                 command.extend(["-loop", "1", "-framerate", str(FPS), "-i", str(path)])
             else:
-                command.extend(["-stream_loop", "-1", "-ss", f"{trim_start:.6f}", "-i", str(path)])
+                command.extend([
+                    "-thread_queue_size",
+                    "128",
+                    "-threads",
+                    str(self._decoder_threads(video_input_count)),
+                    "-stream_loop",
+                    "-1",
+                    "-ss",
+                    f"{trim_start:.6f}",
+                    "-i",
+                    str(path),
+                ])
             media_input_data.append((element, input_index, path, probe))
 
         music_input, _music_probe = self._append_music_input(command, entry_start=entry_start)
@@ -543,7 +819,7 @@ class FFmpegRenderer:
             "[aout]",
             "-t",
             f"{duration:.6f}",
-            *self._encoding_args(),
+            *self._encoding_args(video_inputs=video_input_count),
             str(output_path),
         ])
         run_command(command)
@@ -639,6 +915,7 @@ class FFmpegRenderer:
         sequence = build_playback_sequence(slides)
         if not sequence:
             raise RuntimeError("Timeline tidak memiliki slide biasa yang dapat di-Bake.")
+        self._prepare_render_plan(slides)
         self._prepare_music_bed(max(entry.end for entry in sequence))
 
         normal_entries = [entry for entry in sequence if entry.kind == "slide"]
