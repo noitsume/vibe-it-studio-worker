@@ -473,6 +473,7 @@ class FFmpegRenderer:
             opacity = _clamp(_num(element.get("opacity"), 1.0), 0.0, 1.0)
             speed = _clamp(_num(element.get("speed"), 1.0), 0.25, 4.0)
             rotation = math.radians(_num(element.get("rotation"), 0.0))
+            rotation_expression = f"{rotation:.10f}"
 
             if media_type in {"image", "video"} and probe.get("hasVideo"):
                 media_label = f"media_{media_cursor}"
@@ -482,12 +483,18 @@ class FFmpegRenderer:
                     f"scale={element_width}:{element_height}:force_original_aspect_ratio=increase,"
                     f"crop={element_width}:{element_height},format=rgba,"
                     f"colorchannelmixer=aa={opacity:.6f},"
-                    f"rotate={rotation:.10f}:ow=rotw(iw):oh=roth(ih):c=none"
+                    f"rotate={rotation_expression}:"
+                    f"ow=rotw({rotation_expression}):oh=roth({rotation_expression}):c=none"
                     f"[{media_label}]"
                 )
                 next_video = f"v_media_{media_cursor}"
                 filters.append(
-                    f"[{current_video}][{media_label}]overlay=x={x}:y={y}:"
+                    # CSS merotasi elemen pada titik tengah box. Hasil rotate
+                    # FFmpeg dapat lebih besar dari box, jadi pusat overlay
+                    # harus dikunci kembali ke pusat koordinat editor.
+                    f"[{current_video}][{media_label}]overlay="
+                    f"x={x}+({element_width}-overlay_w)/2:"
+                    f"y={y}+({element_height}-overlay_h)/2:"
                     f"eof_action=pass:shortest=0:format=auto[{next_video}]"
                 )
                 current_video = next_video
