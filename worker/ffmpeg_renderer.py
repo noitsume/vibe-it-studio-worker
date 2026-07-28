@@ -27,9 +27,11 @@ class ResolutionProfile:
 
 
 RESOLUTIONS: dict[str, ResolutionProfile] = {
-    "480": ResolutionProfile(854, 480, 23),
-    "720": ResolutionProfile(1280, 720, 20),
-    "1080": ResolutionProfile(1920, 1080, 18),
+    # Balanced profile: one step cleaner than the legacy output without
+    # paying the large size/time jump of the earlier premium experiment.
+    "480": ResolutionProfile(854, 480, 24),
+    "720": ResolutionProfile(1280, 720, 22),
+    "1080": ResolutionProfile(1920, 1080, 20),
 }
 
 def _transition_blend_expression(transition_type: str, duration: float) -> str:
@@ -266,6 +268,12 @@ class FFmpegRenderer:
             return presets[min(configured_index, presets.index("fast"))]
         return self.preset
 
+    def _effective_crf(self, video_inputs: int) -> int:
+        # Multi-video canvases are already information-dense. Returning one
+        # CRF step toward the legacy target keeps the final compact and avoids
+        # paying the premium quality cost when four decoders are active.
+        return self.profile.crf + (1 if video_inputs >= 3 else 0)
+
     def _encoding_args(self, *, video_inputs: int = 0) -> list[str]:
         encoder_threads = max(
             1,
@@ -279,7 +287,7 @@ class FFmpegRenderer:
             "-preset",
             self._effective_preset(video_inputs),
             "-crf",
-            str(self.profile.crf),
+            str(self._effective_crf(video_inputs)),
             "-profile:v",
             "high",
             "-x264-params",

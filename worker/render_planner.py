@@ -8,6 +8,7 @@ from typing import Any
 from .playback import build_playback_sequence
 
 PROXY_MIN_BYTES = 32 * 1024 * 1024
+PROXY_REUSE_MIN_BYTES = 8 * 1024 * 1024
 PROXY_MIN_PIXEL_SAVING = 0.28
 PROXY_SCALE_HEADROOM = 1.06
 EXPENSIVE_DECODE_CODECS = {
@@ -150,15 +151,30 @@ def build_render_plan(
         target_pixels = target_width * target_height
         pixel_saving = max(0.0, 1.0 - (target_pixels / max(1, source_pixels)))
         codec = str(probe.get("codecName") or "").lower()
+        heavy_source = (
+            file_size >= PROXY_REUSE_MIN_BYTES
+            or source_pixels >= int(1920 * 1080 * 1.5)
+            or codec in EXPENSIVE_DECODE_CODECS
+        )
 
         reasons: list[str] = []
         if peak_video_inputs >= 3 and file_size >= PROXY_MIN_BYTES:
             reasons.append("multi-video-pressure")
-        if usage.occurrences >= 2 and usage.visible_seconds >= 4:
+        if (
+            usage.occurrences >= 2
+            and usage.visible_seconds >= 4
+            and file_size >= PROXY_REUSE_MIN_BYTES
+        ):
             reasons.append("reused-source")
-        if codec in EXPENSIVE_DECODE_CODECS:
+        if (
+            codec in EXPENSIVE_DECODE_CODECS
+            and (
+                file_size >= PROXY_REUSE_MIN_BYTES
+                or source_pixels >= int(1920 * 1080 * 1.5)
+            )
+        ):
             reasons.append(f"expensive-codec:{codec}")
-        if source_fps > output_fps + 1:
+        if source_fps > output_fps + 1 and heavy_source:
             reasons.append("high-fps")
 
         meaningful_resize = pixel_saving >= PROXY_MIN_PIXEL_SAVING
