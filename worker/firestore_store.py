@@ -120,6 +120,10 @@ class FirestoreStore:
         ref.set(
             {
                 "status": "rendering",
+                "workerPhase": "starting",
+                "progressPercent": 35,
+                "progressMessage": "Runner aktif. Memuat snapshot Bake…",
+                "phaseUpdatedAt": self.server_timestamp,
                 "resolution": resolution,
                 "sourceContentHash": source_hash,
                 "attempt": self._firestore.Increment(1),
@@ -131,11 +135,37 @@ class FirestoreStore:
             merge=True,
         )
 
+    def mark_phase(
+        self,
+        job_id: str,
+        *,
+        phase: str,
+        progress: int,
+        message: str,
+        timings_ms: dict[str, int] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "workerPhase": phase[:40],
+            "progressPercent": max(0, min(99, int(progress))),
+            "progressMessage": message[:300],
+            "phaseUpdatedAt": self.server_timestamp,
+        }
+        if timings_ms is not None:
+            payload["timingsMs"] = {
+                str(key)[:40]: max(0, int(value))
+                for key, value in timings_ms.items()
+            }
+        self.db.collection("render_jobs").document(job_id).set(payload, merge=True)
+
     def mark_failed(self, job_id: str, error: BaseException) -> None:
         message = str(error).strip() or error.__class__.__name__
         self.db.collection("render_jobs").document(job_id).set(
             {
                 "status": "failed",
+                "workerPhase": "failed",
+                "progressPercent": 100,
+                "progressMessage": message[:300],
+                "phaseUpdatedAt": self.server_timestamp,
                 "finishedAt": self.server_timestamp,
                 "errorCode": error.__class__.__name__[:80],
                 "errorMessage": message[:1500],
@@ -155,6 +185,7 @@ class FirestoreStore:
         file_size: int,
         sha256: str,
         receiver_token_hash: str | None,
+        timings_ms: dict[str, int],
     ) -> None:
         batch = self.db.batch()
         job_ref = self.db.collection("render_jobs").document(job_id)
@@ -165,6 +196,14 @@ class FirestoreStore:
             job_ref,
             {
                 "status": "success",
+                "workerPhase": "completed",
+                "progressPercent": 100,
+                "progressMessage": "Bake selesai. Preview Final siap ditonton.",
+                "phaseUpdatedAt": self.server_timestamp,
+                "timingsMs": {
+                    str(key)[:40]: max(0, int(value))
+                    for key, value in timings_ms.items()
+                },
                 "finalPath": final_path,
                 "finishedAt": self.server_timestamp,
                 "errorCode": None,

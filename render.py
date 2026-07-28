@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,32 @@ from typing import Any
 from worker.ffmpeg_renderer import FFmpegRenderer, RESOLUTIONS
 from worker.schema import validate_media_library, validate_timeline
 from worker.utils import configure_logging, ensure_relative_b2_path, require_safe_id, sha256_file
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.perf_counter() - started_at) * 1000))
+
+
+def _report_phase(
+    store: Any,
+    job_id: str,
+    *,
+    phase: str,
+    progress: int,
+    message: str,
+    timings_ms: dict[str, int],
+) -> None:
+    try:
+        store.mark_phase(
+            job_id,
+            phase=phase,
+            progress=progress,
+            message=message,
+            timings_ms=timings_ms,
+        )
+    except Exception:
+        # Telemetry tidak boleh menggagalkan render yang masih sehat.
+        logging.exception("Gagal memperbarui telemetry fase %s", phase)
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,6 +179,8 @@ def _render_remote(args: argparse.Namespace) -> int:
     job_id = require_safe_id(store.resolve_job_id(room_id, requested_job_id), "job_id")
     job_record_ready = False
     uploaded_version = None
+    total_started_at = time.perf_counter()
+    timings_ms: dict[str, int] = {}
 
     temporary_root = Path(tempfile.mkdtemp(prefix=f"vibeit-{room_id}-{job_id}-"))
     logging.info("Workspace: %s", temporary_root)
@@ -180,13 +209,32 @@ def _render_remote(args: argparse.Namespace) -> int:
 
         source_hash = timeline.get("contentHash") or source.job.get("sourceContentHash")
         store.mark_started(job_id, resolution=args.resolution, source_hash=source_hash)
+        timings_ms["startup"] = _elapsed_ms(total_started_at)
 
+        phase_started_at = time.perf_counter()
+        _report_phase(
+            store,
+            job_id,
+            phase="downloading",
+            progress=42,
+            message=f"Mengunduh {len(media_library)} media asli dari storage…",
+            timings_ms=timings_ms,
+        )
         media_dir = temporary_root / "media"
         media_paths = _download_media(
             storage,
             media_library,
             media_dir,
             workers=config.download_workers,
+        )
+        timings_ms["download"] = _elapsed_ms(phase_started_at)
+        _report_phase(
+            store,
+            job_id,
+            phase="preparing",
+            progress=52,
+            message="Menganalisis media dan menyiapkan render plan…",
+            timings_ms=timings_ms,
         )
         final_local = args.output.resolve() if args.output else temporary_root / "final.mp4"
         renderer = FFmpegRenderer(
@@ -199,8 +247,27 @@ def _render_remote(args: argparse.Namespace) -> int:
             music=timeline.get("music") or {},
             proxy_workers=config.proxy_workers,
         )
+        phase_started_at = time.perf_counter()
+        _report_phase(
+            store,
+            job_id,
+            phase="rendering",
+            progress=58,
+            message="FFmpeg sedang merender media asli…",
+            timings_ms=timings_ms,
+        )
         duration = renderer.render(list(timeline.get("slides") or []), final_local)
+        timings_ms["render"] = _elapsed_ms(phase_started_at)
         final_remote = f"rooms/{room_id}/final/current.mp4"
+        phase_started_at = time.perf_counter()
+        _report_phase(
+            store,
+            job_id,
+            phase="uploading",
+            progress=90,
+            message="Mengunggah Final Video ke storage…",
+            timings_ms=timings_ms,
+        )
         digest = sha256_file(final_local)
         uploaded_version = storage.upload(
             final_local,
@@ -213,6 +280,16 @@ def _render_remote(args: argparse.Namespace) -> int:
                 "content-sha256": digest,
             },
         )
+        timings_ms["upload"] = _elapsed_ms(phase_started_at)
+        _report_phase(
+            store,
+            job_id,
+            phase="finalizing",
+            progress=97,
+            message="Memverifikasi hasil dan memperbarui Preview Final…",
+            timings_ms=timings_ms,
+        )
+        timings_ms["total"] = _elapsed_ms(total_started_at)
         store.mark_success(
             room_id=room_id,
             job_id=job_id,
@@ -223,6 +300,7 @@ def _render_remote(args: argparse.Namespace) -> int:
             file_size=final_local.stat().st_size,
             sha256=digest,
             receiver_token_hash=source.room.get("receiverTokenHash"),
+            timings_ms=timings_ms,
         )
         try:
             removed = storage.delete_prefix_except(

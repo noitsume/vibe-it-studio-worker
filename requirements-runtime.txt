@@ -1,0 +1,2 @@
+firebase-admin>=7.0,<8
+b2sdk>=2,<3
