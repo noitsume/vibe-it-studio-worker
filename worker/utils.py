@@ -41,15 +41,37 @@ def run_command(
     *,
     cwd: Path | None = None,
     capture_output: bool = False,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     logging.debug("Menjalankan: %s", " ".join(command))
-    return subprocess.run(
-        list(command),
-        cwd=str(cwd) if cwd else None,
-        check=True,
-        text=True,
-        capture_output=capture_output,
+    timeout = timeout_seconds or bounded_int(
+        os.getenv("WORKER_COMMAND_TIMEOUT_SECONDS"),
+        30 * 60,
+        30,
+        6 * 60 * 60,
     )
+    try:
+        return subprocess.run(
+            list(command),
+            cwd=str(cwd) if cwd else None,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        executable = Path(str(command[0])).name
+        raise RuntimeError(
+            f"{executable} melewati timeout {timeout} detik. "
+            "Periksa media corrupt, durasi, atau kompleksitas filter."
+        ) from error
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").strip() if isinstance(error.stderr, str) else ""
+        diagnostic = stderr[-3000:] if stderr else "tanpa stderr"
+        raise RuntimeError(
+            f"Perintah {Path(str(command[0])).name} gagal (exit {error.returncode}): {diagnostic}"
+        ) from error
 
 
 def sha256_file(path: Path) -> str:
@@ -78,5 +100,3 @@ def ensure_relative_b2_path(path: str, label: str = "B2 path") -> str:
     if not normalized or normalized.startswith(".") or ".." in normalized.split("/"):
         raise ValueError(f"{label} tidak valid: {path!r}")
     return normalized
-
-

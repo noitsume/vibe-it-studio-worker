@@ -37,7 +37,7 @@ RESOLUTIONS: dict[str, ResolutionProfile] = {
 def _transition_blend_expression(transition_type: str, duration: float) -> str:
     ratio = f"min(max(T/{max(0.001, duration):.6f},0),1)"
     normalized = transition_type.lower()
-    if normalized in {"wipeleft", "slideleft", "slide-left"}:
+    if normalized in {"slide", "wipeleft", "slideleft", "slide-left"}:
         return f"if(lte(X,W*({ratio})),B,A)"
     if normalized in {"wiperight", "slideright", "slide-right"}:
         return f"if(gte(X,W*(1-({ratio}))),B,A)"
@@ -45,7 +45,7 @@ def _transition_blend_expression(transition_type: str, duration: float) -> str:
         return f"if(lte(Y,H*({ratio})),B,A)"
     if normalized in {"wipedown", "slidedown", "slide-down"}:
         return f"if(gte(Y,H*(1-({ratio}))),B,A)"
-    if normalized == "circleopen":
+    if normalized in {"zoom", "zoomin", "circleopen"}:
         return f"if(lte(hypot(X-W/2,Y-H/2),hypot(W/2,H/2)*({ratio})),B,A)"
     if normalized == "circleclose":
         return f"if(gte(hypot(X-W/2,Y-H/2),hypot(W/2,H/2)*(1-({ratio}))),B,A)"
@@ -88,6 +88,60 @@ def _atempo_chain(speed: float) -> str:
         speed /= 0.5
     factors.append(speed)
     return ",".join(f"atempo={factor:.6f}" for factor in factors)
+
+
+def _visual_filter_chain(element: dict[str, Any], width: int, height: int) -> list[str]:
+    """Build the visual part of an instance filter chain from editor state."""
+    fit = str(element.get("fit") or "cover").lower()
+    focal_x = _clamp(_num(element.get("focalX"), 50.0), 0.0, 100.0) / 100.0
+    focal_y = _clamp(_num(element.get("focalY"), 50.0), 0.0, 100.0) / 100.0
+    if fit == "contain":
+        visual = [
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+            f"pad={width}:{height}:(ow-iw)*{focal_x:.6f}:(oh-ih)*{focal_y:.6f}:color=black@0",
+        ]
+    elif fit == "fill":
+        visual = [f"scale={width}:{height}"]
+    else:
+        visual = [
+            f"scale={width}:{height}:force_original_aspect_ratio=increase",
+            f"crop={width}:{height}:(iw-ow)*{focal_x:.6f}:(ih-oh)*{focal_y:.6f}",
+        ]
+
+    if bool(element.get("flipX")):
+        visual.append("hflip")
+    if bool(element.get("flipY")):
+        visual.append("vflip")
+
+    brightness = _clamp(_num(element.get("brightness"), 100.0), 0.0, 200.0)
+    contrast = _clamp(_num(element.get("contrast"), 100.0), 0.0, 200.0)
+    saturation = _clamp(_num(element.get("saturation"), 100.0), 0.0, 200.0)
+    grayscale = _clamp(_num(element.get("grayscale"), 0.0), 0.0, 100.0)
+    effective_saturation = (saturation / 100.0) * (1.0 - grayscale / 100.0)
+    # FFmpeg eq brightness is additive (-1..1), while editor brightness is 0..200%.
+    visual.append(
+        "eq="
+        f"brightness={(brightness - 100.0) / 100.0:.6f}:"
+        f"contrast={contrast / 100.0:.6f}:saturation={effective_saturation:.6f}"
+    )
+    blur = _clamp(_num(element.get("blur"), 0.0), 0.0, 20.0)
+    if blur > 0.01:
+        visual.append(f"gblur=sigma={blur:.6f}:steps=1")
+    return visual
+
+
+def _rounded_alpha_filter(radius: float, width: int, height: int) -> str | None:
+    radius = min(_clamp(radius, 0.0, 1000.0), width / 2.0, height / 2.0)
+    if radius < 0.5:
+        return None
+    # Preserve every source component and replace alpha only outside the rounded corners.
+    inner_x = width / 2.0 - radius
+    inner_y = height / 2.0 - radius
+    alpha = (
+        "if(lte(abs(X-W/2),{ix:.6f})*lte(abs(Y-H/2),{iy:.6f}),alpha(X,Y),"
+        "if(lte(hypot(abs(X-W/2)-{ix:.6f},abs(Y-H/2)-{iy:.6f}),{r:.6f}),alpha(X,Y),0))"
+    ).format(ix=inner_x, iy=inner_y, r=radius)
+    return f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}'"
 
 
 def _frame_rate(value: Any) -> float:
@@ -184,6 +238,8 @@ class FontResolver:
         fallbacks = [
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
             Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+            Path(os.environ.get("WINDIR", r"C:\\Windows")) / "Fonts" / "segoeui.ttf",
+            Path(os.environ.get("WINDIR", r"C:\\Windows")) / "Fonts" / "arial.ttf",
         ]
         for fallback in fallbacks:
             if fallback.exists():
@@ -720,7 +776,7 @@ class FFmpegRenderer:
         media_cursor = 0
         for element in elements:
             if element.get("type") == "text":
-                x, y, element_width, _element_height = self._position(element)
+                x, y, element_width, element_height = self._position(element)
                 font_size = max(8, round(_num(element.get("fontSize"), 32) * width / CANONICAL_WIDTH))
                 text_path = self._write_text_file(element, element_width, font_size)
                 font_path = self.fonts.resolve(
@@ -730,17 +786,29 @@ class FFmpegRenderer:
                 )
                 opacity = _clamp(_num(element.get("opacity"), 1.0), 0.0, 1.0)
                 next_video = f"v_text_{self.text_counter}"
+                text_source = f"text_source_{self.text_counter}"
+                rotation = math.radians(_num(element.get("rotation"), 0.0))
+                rotation_expression = f"{rotation:.10f}"
                 filters.append(
-                    f"[{current_video}]drawtext="
+                    f"color=c=black@0.0:s={element_width}x{element_height}:r={FPS}:d={duration:.6f},"
+                    f"format=rgba[{text_source}]"
+                )
+                filters.append(
+                    f"[{text_source}]drawtext="
                     f"fontfile='{_escape_filter_path(font_path)}':"
                     f"textfile='{_escape_filter_path(text_path)}':"
                     f"fontcolor={_escape_color(element.get('color'))}:"
-                    f"fontsize={font_size}:x={x}:y={y}:"
-                    f"alpha={opacity:.6f}:line_spacing={max(1, round(font_size * 0.18))}"
-                    f"[{next_video}]"
+                    f"fontsize={font_size}:x=(w-text_w)/2:y=(h-text_h)/2:"
+                    f"alpha={opacity:.6f}:line_spacing={max(1, round(font_size * 0.18))},"
+                    f"rotate={rotation_expression}:"
+                    f"ow=rotw({rotation_expression}):oh=roth({rotation_expression}):c=none[text_{self.text_counter}]"
                 )
-                if abs(_num(element.get("rotation"), 0)) > 0.01:
-                    logging.warning("Rotasi text belum diraster presisi; text dirender tanpa rotasi.")
+                filters.append(
+                    f"[{current_video}][text_{self.text_counter}]overlay="
+                    f"x={x}+({element_width}-overlay_w)/2:"
+                    f"y={y}+({element_height}-overlay_h)/2:"
+                    f"eof_action=pass:shortest=0:format=auto[{next_video}]"
+                )
                 current_video = next_video
                 continue
 
@@ -762,14 +830,25 @@ class FFmpegRenderer:
             if media_type in {"image", "video"} and probe.get("hasVideo"):
                 media_label = f"media_{media_cursor}"
                 setpts = "PTS-STARTPTS" if media_type == "image" else f"(PTS-STARTPTS)/{speed:.8f}"
-                filters.append(
-                    f"[{input_index}:v]setpts={setpts},trim=duration={duration:.6f},"
-                    f"scale={element_width}:{element_height}:force_original_aspect_ratio=increase,"
-                    f"crop={element_width}:{element_height},format=rgba,"
-                    f"colorchannelmixer=aa={opacity:.6f},"
+                visual_filters = _visual_filter_chain(element, element_width, element_height)
+                rounded_alpha = _rounded_alpha_filter(
+                    _num(element.get("borderRadius"), 0.0), element_width, element_height
+                )
+                filter_chain = [
+                    f"[{input_index}:v]setpts={setpts}",
+                    f"trim=duration={duration:.6f}",
+                    *visual_filters,
+                    "format=rgba",
+                    f"colorchannelmixer=aa={opacity:.6f}",
+                ]
+                if rounded_alpha:
+                    filter_chain.append(rounded_alpha)
+                filter_chain.extend([
                     f"rotate={rotation_expression}:"
-                    f"ow=rotw({rotation_expression}):oh=roth({rotation_expression}):c=none"
-                    f"[{media_label}]"
+                    f"ow=rotw({rotation_expression}):oh=roth({rotation_expression}):c=none",
+                ])
+                filters.append(
+                    ",".join(filter_chain) + f"[{media_label}]"
                 )
                 next_video = f"v_media_{media_cursor}"
                 filters.append(
@@ -795,10 +874,43 @@ class FFmpegRenderer:
                 source_duration = duration * speed
                 volume = _clamp(_num(element.get("volume"), 100.0) / 100.0, 0.0, 2.0)
                 audio_label = f"audio_{media_cursor}"
+                audio_chain = [
+                    f"[{input_index}:a]atrim=duration={source_duration:.6f}",
+                    "asetpts=PTS-STARTPTS",
+                    _atempo_chain(speed),
+                ]
+                fade_in = min(duration, _clamp(_num(element.get("fadeIn"), 0.0), 0.0, 60.0))
+                fade_out = min(duration, _clamp(_num(element.get("fadeOut"), 0.0), 0.0, 60.0))
+                if fade_in > 0.01:
+                    audio_chain.append(f"afade=t=in:st=0:d={fade_in:.6f}")
+                if fade_out > 0.01:
+                    audio_chain.append(f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}")
+                bass_gain = _clamp(_num(element.get("bassGain"), 0.0), -20.0, 20.0)
+                mid_gain = _clamp(_num(element.get("midGain"), 0.0), -20.0, 20.0)
+                treble_gain = _clamp(_num(element.get("trebleGain"), 0.0), -20.0, 20.0)
+                if abs(bass_gain) > 0.01:
+                    audio_chain.append(f"bass=g={bass_gain:.6f}")
+                if abs(mid_gain) > 0.01:
+                    audio_chain.append(f"equalizer=f=1000:t=q:w=1:g={mid_gain:.6f}")
+                if abs(treble_gain) > 0.01:
+                    audio_chain.append(f"treble=g={treble_gain:.6f}")
+                pan = _clamp(_num(element.get("audioPan"), 0.0), -100.0, 100.0) / 100.0
+                if abs(pan) > 0.01:
+                    left_gain = min(1.0, 1.0 - pan)
+                    right_gain = min(1.0, 1.0 + pan)
+                    audio_chain.extend([
+                        "aformat=channel_layouts=stereo",
+                        f"pan=stereo|c0={left_gain:.6f}*c0|c1={right_gain:.6f}*c1",
+                    ])
+                if bool(element.get("normalizeAudio")):
+                    audio_chain.append("dynaudnorm=f=150:g=15")
+                audio_chain.extend([
+                    f"volume={volume:.6f}",
+                    "apad",
+                    f"atrim=duration={duration:.6f}",
+                ])
                 filters.append(
-                    f"[{input_index}:a]atrim=duration={source_duration:.6f},"
-                    f"asetpts=PTS-STARTPTS,{_atempo_chain(speed)},"
-                    f"volume={volume:.6f},apad,atrim=duration={duration:.6f}[{audio_label}]"
+                    ",".join(audio_chain) + f"[{audio_label}]"
                 )
                 audio_labels.append(audio_label)
 

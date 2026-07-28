@@ -83,6 +83,39 @@ def validate_timeline(timeline: dict[str, Any], max_bytes: int) -> None:
                 )
             if element.get("type") == "media" and not str(element.get("mediaId") or ""):
                 raise ValueError(f"Media element {slide_index}:{element_index} tidak memiliki mediaId.")
+            if element.get("type") == "media":
+                ranged_fields = {
+                    "borderRadius": (0, 1000),
+                    "focalX": (0, 100),
+                    "focalY": (0, 100),
+                    "brightness": (0, 200),
+                    "contrast": (0, 200),
+                    "saturation": (0, 200),
+                    "grayscale": (0, 100),
+                    "blur": (0, 20),
+                    "trimStart": (0, 86400),
+                    "trimEnd": (0, 86400),
+                    "speed": (0.05, 20),
+                    "volume": (0, 100),
+                    "fadeIn": (0, 60),
+                    "fadeOut": (0, 60),
+                    "audioPan": (-100, 100),
+                    "bassGain": (-20, 20),
+                    "midGain": (-20, 20),
+                    "trebleGain": (-20, 20),
+                }
+                for key, (minimum, maximum) in ranged_fields.items():
+                    if key in element:
+                        _finite_number(
+                            element[key],
+                            f"element {slide_index}:{element_index}.{key}",
+                            minimum=minimum,
+                            maximum=maximum,
+                        )
+                if element.get("fit", "cover") not in {"cover", "contain", "fill"}:
+                    raise ValueError(
+                        f"element {slide_index}:{element_index}.fit tidak didukung."
+                    )
 
     if element_count > MAX_ELEMENTS:
         raise ValueError(f"Jumlah element melewati batas {MAX_ELEMENTS}.")

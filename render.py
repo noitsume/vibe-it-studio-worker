@@ -188,6 +188,16 @@ def _render_remote(args: argparse.Namespace) -> int:
         job_snapshot = store.db.collection("render_jobs").document(job_id).get()
         job_preview = job_snapshot.to_dict() if job_snapshot.exists else {}
         job_record_ready = job_snapshot.exists
+        if job_snapshot.exists and str(job_preview.get("roomId")) != room_id:
+            raise RuntimeError("render_jobs jobId tidak dimiliki room yang diminta.")
+        if job_snapshot.exists:
+            # Tulis status aktif sebelum snapshot/B2 download agar waktu setup
+            # tidak salah terbaca sebagai antrean oleh editor.
+            store.mark_started(
+                job_id,
+                resolution=args.resolution,
+                source_hash=job_preview.get("sourceContentHash"),
+            )
         snapshot_payload = None
         snapshot_path = (job_preview or {}).get("snapshotPath")
         if snapshot_path:
@@ -208,7 +218,9 @@ def _render_remote(args: argparse.Namespace) -> int:
         validate_media_library(media_library, config.max_media_bytes)
 
         source_hash = timeline.get("contentHash") or source.job.get("sourceContentHash")
-        store.mark_started(job_id, resolution=args.resolution, source_hash=source_hash)
+        if not job_snapshot.exists:
+            store.mark_started(job_id, resolution=args.resolution, source_hash=source_hash)
+            job_record_ready = True
         timings_ms["startup"] = _elapsed_ms(total_started_at)
 
         phase_started_at = time.perf_counter()

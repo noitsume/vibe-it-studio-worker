@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,18 @@ class B2Storage:
     def download(self, remote_path: str, local_path: Path) -> Path:
         remote = ensure_relative_b2_path(remote_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        logging.info("Download B2: %s", remote)
-        downloaded = self.bucket.download_file_by_name(remote)
-        downloaded.save_to(str(local_path))
-        return local_path
+        for attempt in range(1, 4):
+            try:
+                logging.info("Download B2: %s (attempt %s/3)", remote, attempt)
+                downloaded = self.bucket.download_file_by_name(remote)
+                downloaded.save_to(str(local_path))
+                return local_path
+            except Exception:
+                if attempt >= 3:
+                    raise
+                logging.warning("Download B2 gagal sementara; retry %s.", attempt + 1)
+                time.sleep(2 ** (attempt - 1))
+        raise RuntimeError(f"Download B2 gagal: {remote}")
 
     def upload(
         self,
@@ -34,13 +43,21 @@ class B2Storage:
         file_info: dict[str, str] | None = None,
     ) -> Any:
         remote = ensure_relative_b2_path(remote_path)
-        logging.info("Upload B2: %s", remote)
-        return self.bucket.upload_local_file(
-            local_file=str(local_path),
-            file_name=remote,
-            content_type=content_type,
-            file_info=file_info or {},
-        )
+        for attempt in range(1, 4):
+            try:
+                logging.info("Upload B2: %s (attempt %s/3)", remote, attempt)
+                return self.bucket.upload_local_file(
+                    local_file=str(local_path),
+                    file_name=remote,
+                    content_type=content_type,
+                    file_info=file_info or {},
+                )
+            except Exception:
+                if attempt >= 3:
+                    raise
+                logging.warning("Upload B2 gagal sementara; retry %s.", attempt + 1)
+                time.sleep(2 ** (attempt - 1))
+        raise RuntimeError(f"Upload B2 gagal: {remote}")
 
     def delete_prefix(self, prefix: str, *, apply: bool) -> int:
         safe_prefix = ensure_relative_b2_path(prefix)

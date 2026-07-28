@@ -42,3 +42,58 @@ def test_media_rejects_parent_path() -> None:
             ],
             1000,
         )
+
+
+def test_timeline_accepts_instance_effect_settings() -> None:
+    timeline = valid_timeline()
+    timeline["slides"][0]["elements"] = [
+        {
+            "id": "media-1",
+            "type": "media",
+            "mediaType": "video",
+            "mediaId": "m1",
+            "x": 5,
+            "y": 8,
+            "w": 80,
+            "h": 70,
+            "rotation": 12,
+            "opacity": 0.8,
+            "zIndex": 1,
+            "fit": "contain",
+            "focalX": 35,
+            "focalY": 70,
+            "brightness": 105,
+            "contrast": 110,
+            "saturation": 90,
+            "grayscale": 10,
+            "blur": 1.5,
+            "fadeIn": 0.5,
+            "fadeOut": 0.5,
+            "audioPan": -25,
+            "bassGain": 2,
+            "midGain": 0,
+            "trebleGain": -1,
+        }
+    ]
+    validate_timeline(timeline, 900 * 1024)
+
+
+def test_timeline_rejects_unknown_media_fit() -> None:
+    timeline = valid_timeline()
+    timeline["slides"][0]["elements"] = [
+        {
+            "id": "media-1",
+            "type": "media",
+            "mediaId": "m1",
+            "x": 0,
+            "y": 0,
+            "w": 10,
+            "h": 10,
+            "rotation": 0,
+            "opacity": 1,
+            "zIndex": 0,
+            "fit": "stretch-forever",
+        }
+    ]
+    with pytest.raises(ValueError, match="fit"):
+        validate_timeline(timeline, 900 * 1024)
